@@ -1,9 +1,9 @@
 name: Masscan Port Scanner
 
 on:
-  workflow_dispatch:  # تشغيل يدوي
+  workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0'  # أسبوعي (كل أحد الساعة 12 ص)
+    - cron: '0 0 * * 0'
 
 jobs:
   masscan-scan:
@@ -16,7 +16,7 @@ jobs:
       - name: Install Masscan
         run: |
           sudo apt-get update
-          sudo apt-get install -y masscan
+          sudo apt-get install -y masscan jq
 
       - name: Check IP list exists
         run: |
@@ -40,32 +40,75 @@ jobs:
       - name: Send results to Discord
         if: always()
         run: |
-          SCAN_RESULTS=$(cat scan.txt | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
           SCAN_COUNT=$(wc -l < scan.txt)
+          FILE_SIZE=$(stat -c%s scan.txt)
+          TIMESTAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
           
-          curl -H "Content-Type: application/json" \
-            -X POST \
-            -d "{
-              \"username\": \"Masscan Bot\",
-              \"avatar_url\": \"https://i.imgur.com/4M34hi2.png\",
-              \"embeds\": [{
-                \"title\": \"🔍 Masscan Port Scan Complete\",
-                \"color\": 3447003,
-                \"fields\": [
-                  {
-                    \"name\": \"📋 Scan Details\",
-                    \"value\": \"**Target:** \`ip\` file\n**Ports:** 1-10000\n**Rate:** 2000\n**Results Count:** \`${SCAN_COUNT}\`\",
-                    \"inline\": false
-                  },
-                  {
-                    \"name\": \"📝 Raw Results\",
-                    \"value\": \"\`\`\`\\n${SCAN_RESULTS}\\n\`\`\`\",
-                    \"inline\": false
-                  }
-                ],
-                \"footer\": {
-                  \"text\": \"Masscan Scanner | $(date -u +'%Y-%m-%d %H:%M UTC')\"
-                }
-              }]
-            }" \
-            ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Discord limits: embed field value 1024 chars, total embed 6000 chars
+          # File attachment limit: 25MB (8MB for free servers)
+          MAX_EMBED_CHARS=1800
+          
+          # نجرب نقرأ الملف ونشوف حجمه
+          SCAN_RESULTS=$(cat scan.txt | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          RESULTS_LENGTH=${#SCAN_RESULTS}
+          
+          if [ "$RESULTS_LENGTH" -gt "$MAX_EMBED_CHARS" ] || [ "$FILE_SIZE" -gt 8000000 ]; then
+            # الملف كبير - نبعته كـ attachment مع summary بس
+            echo "File too large for embed ($RESULTS_LENGTH chars, $FILE_SIZE bytes). Sending as attachment."
+            
+            jq -n \
+              --arg username "Masscan Bot" \
+              --arg avatar_url "https://i.imgur.com/4M34hi2.png" \
+              --arg title "🔍 Masscan Port Scan Complete" \
+              --arg count "$SCAN_COUNT" \
+              --arg size "$FILE_SIZE" \
+              --arg footer "Masscan Scanner | $TIMESTAMP" \
+              '{
+                username: $username,
+                avatar_url: $avatar_url,
+                embeds: [{
+                  title: $title,
+                  color: 3447003,
+                  description: "Scan completed for ports 1-10000 at rate 2000.\n**Total results:** `\($count)` lines\n**File size:** `\($size)` bytes\n\n📎 **Full results attached below**",
+                  footer: { text: $footer }
+                }]
+              }' > /tmp/discord_payload.json
+            
+            # نبعت الـ JSON + الملف كـ attachment
+            curl -F "payload_json=$(cat /tmp/discord_payload.json)" \
+              -F "file1=@scan.txt;filename=masscan-results.txt" \
+              ${{ secrets.DISCORD_WEBHOOK_URL }}
+          else
+            # الملف صغير - نحطه في الـ embed عادي
+            jq -n \
+              --arg username "Masscan Bot" \
+              --arg avatar_url "https://i.imgur.com/4M34hi2.png" \
+              --arg title "🔍 Masscan Port Scan Complete" \
+              --arg count "$SCAN_COUNT" \
+              --arg results "$SCAN_RESULTS" \
+              --arg footer "Masscan Scanner | $TIMESTAMP" \
+              '{
+                username: $username,
+                avatar_url: $avatar_url,
+                embeds: [{
+                  title: $title,
+                  color: 3447003,
+                  fields: [
+                    {
+                      name: "📋 Scan Details",
+                      value: "**Target:** `ip` file\n**Ports:** 1-10000\n**Rate:** 2000\n**Results Count:** `\($count)`",
+                      inline: false
+                    },
+                    {
+                      name: "📝 Raw Results",
+                      value: "```\n\($results)\n```",
+                      inline: false
+                    }
+                  ],
+                  footer: { text: $footer }
+                }]
+              }' | curl -H "Content-Type: application/json" \
+                -X POST \
+                --data-binary @- \
+                ${{ secrets.DISCORD_WEBHOOK_URL }}
+          fi
